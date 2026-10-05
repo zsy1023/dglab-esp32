@@ -1,0 +1,14 @@
+# PlatformIO 构建产物（别入库）
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# IDE / 编辑器
+.vscode/
+.idea/
+*.code-workspace
+
+# 系统
+Thumbs.db
+desktop.ini
+.DS_Store
