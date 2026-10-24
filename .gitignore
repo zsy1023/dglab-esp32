@@ -3,6 +3,14 @@
 .pioenvs/
 .piolibdeps/
 
+# 脱硬件单测产物（g++ 编出来的可执行文件）
+test_host_state
+test_host_state.exe
+
+# Python（examples/ 跑起来会生成）
+__pycache__/
+*.pyc
+
 # IDE / 编辑器
 .vscode/
 .idea/

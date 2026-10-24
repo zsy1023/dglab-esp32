@@ -1,0 +1,760 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>dglab-esp32 · 串口示波台</title>
+<!--
+  dglab-esp32 的串口调试页（单文件，无需构建、无需后端）
+  SPDX-License-Identifier: GPL-3.0-or-later
+  Copyright (C) 2026 zsyfpv
+
+  用途：浏览器（Chrome / Edge）用 Web Serial 直连板子的 COM 口，把固件打的 '#' 日志
+  变成"活"的状态：A/B 通道强度、软上限、每 25ms 一组的波形、回路通断，
+  并且能反过来控制 —— 强度点动/绝对值、A/B 各自的回路开关。
+
+  怎么用：
+    1. 关掉串口监视器 / PC 侧上位机（**串口是独占的**）
+    2. Chrome 或 Edge 打开本文件（file:// 通常可用；不行就 `python -m http.server 8000` 后开 http://localhost:8000/）
+    3. 点「连接串口」→ 选板子的口（115200 8N1）
+
+  注意：网页**从不发 0xCE**（那个字节会让固件把原始二进制帧也上行出来，污染文本）。
+  板子可能会在打开串口时复位一次（DTR/RTS 抖动），正常现象。
+-->
+<style>
+  :root {
+    --bg: #0f0e0c;
+    --panel: #171510;
+    --panel2: #1e1b14;
+    --line: #2e2a20;
+    --fg: #e9e4d6;
+    --dim: #8b8574;
+    --gold: #ffe99d;
+    --gold-dim: #7a6a3a;
+    --a: #ffe99d;
+    --b: #9dd8ff;
+    --warn: #ff9d9d;
+    --ok: #9dffb0;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    padding: 14px 18px; border-bottom: 1px solid var(--line); background: var(--panel);
+  }
+  h1 { font-size: 16px; margin: 0; letter-spacing: .5px; }
+  h1 small { color: var(--dim); font-weight: 400; margin-left: 8px; font-size: 12px; }
+  .grow { flex: 1; }
+  button {
+    background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 13px; cursor: pointer; font: inherit;
+  }
+  button:hover:not(:disabled) { border-color: var(--gold-dim); color: var(--gold); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  button.primary { border-color: var(--gold-dim); color: var(--gold); }
+  button.primary.armed { background: var(--gold); color: #1a1608; border-color: var(--gold); }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #4a463a; display: inline-block; }
+  .dot.on { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.err { background: var(--warn); }
+  .status { color: var(--dim); font-size: 12px; }
+  main { padding: 16px 18px 28px; display: grid; gap: 16px; }
+  .chips { display: flex; gap: 10px; flex-wrap: wrap; }
+  .chip {
+    display: flex; align-items: center; gap: 7px; padding: 6px 12px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: 999px;
+    font-size: 12px; color: var(--dim);
+  }
+  .chip b { color: var(--fg); font-weight: 600; }
+  .chans { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+  .card {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 14px;
+    padding: 14px 16px 16px; display: grid; gap: 12px;
+  }
+  .card.open { border-color: #4a3a3a; }
+  .cardHead { display: flex; align-items: center; gap: 10px; }
+  .tag {
+    font-size: 12px; font-weight: 700; letter-spacing: 1px; padding: 2px 9px;
+    border-radius: 6px; background: var(--panel2); border: 1px solid var(--line);
+  }
+  .card[data-ch="0"] .tag { color: var(--a); border-color: var(--gold-dim); }
+  .card[data-ch="1"] .tag { color: var(--b); border-color: #33556b; }
+  .loopCtl { margin-left: auto; display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--dim); }
+  .switch { position: relative; width: 44px; height: 24px; flex: none; }
+  .switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; cursor: pointer; }
+  .switch span {
+    position: absolute; inset: 0; border-radius: 999px; background: #3a3226;
+    border: 1px solid var(--line); transition: background .15s, border-color .15s;
+  }
+  .switch span::after {
+    content: ""; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px;
+    border-radius: 50%; background: var(--dim); transition: transform .15s, background .15s;
+  }
+  .switch input:checked + span { background: #2c3a22; border-color: #4e6b39; }
+  .switch input:checked + span::after { transform: translateX(20px); background: var(--ok); }
+  .strength { display: flex; align-items: flex-end; gap: 14px; flex-wrap: wrap; }
+  .num { font-size: 40px; font-weight: 700; line-height: 1; color: var(--gold); font-variant-numeric: tabular-nums; }
+  .num .cap { font-size: 15px; color: var(--dim); font-weight: 500; }
+  .bar { position: relative; height: 8px; border-radius: 999px; background: #241f16; flex: 1 1 140px; min-width: 120px; }
+  .bar i { position: absolute; inset: 0 auto 0 0; border-radius: 999px; background: linear-gradient(90deg, var(--gold-dim), var(--gold)); }
+  .bar u {
+    position: absolute; top: -4px; bottom: -4px; width: 2px; background: var(--warn); opacity: .85;
+    border-radius: 2px;
+  }
+  .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .row input[type="number"] {
+    width: 76px; background: var(--panel2); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 8px; padding: 7px 9px; font: inherit;
+  }
+  .stepbtn { min-width: 44px; font-size: 17px; font-weight: 700; padding: 6px 0; }
+  canvas { width: 100%; height: 108px; display: block; border-radius: 10px; background: #100e0a; border: 1px solid var(--line); }
+  .groups { display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px; font-size: 12px; }
+  .grp {
+    background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+    padding: 5px 6px; text-align: center; color: var(--dim);
+  }
+  .grp b { display: block; color: var(--fg); font-size: 15px; font-variant-numeric: tabular-nums; line-height: 1.2; }
+  .grp .fq { display: block; color: var(--dim); font-size: 11px; }
+  .grp.bad { border-color: #4a3a3a; opacity: .62; }
+  .waveState { font-size: 12px; color: var(--dim); min-height: 18px; }
+  .hint { color: var(--dim); font-size: 12px; }
+  .hint code { color: var(--gold); }
+  .logwrap { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px; }
+  .logHead { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }
+  .logHead h2 { font-size: 13px; margin: 0; color: var(--dim); font-weight: 600; }
+  #log {
+    margin: 0; max-height: 190px; overflow: auto; font-family: ui-monospace, Consolas, monospace;
+    font-size: 11.5px; line-height: 1.45; color: #b9b2a0; white-space: pre-wrap; word-break: break-all;
+  }
+  #log .l-b0 { color: #8d8874; }
+  #log .l-str { color: var(--gold); }
+  #log .l-link { color: var(--b); }
+  #log .l-err { color: var(--warn); }
+  .err { color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>dglab-esp32 · 串口示波台 <small>假郊狼主机 · 强度 / 波形 / 回路</small></h1>
+  <div class="grow"></div>
+  <span class="status"><span id="dot" class="dot"></span> <span id="statusText">未连接</span></span>
+  <button id="btnConnect" class="primary">连接串口</button>
+  <button id="btnVerbose" title="让固件逐条打 B0 日志（0xC3 / 0xC2）">逐帧日志：开</button>
+</header>
+
+<main>
+  <section class="chips">
+    <div class="chip">手机 App <b id="cConn">—</b></div>
+    <div class="chip">0x150B 订阅 <b id="cSub">—</b></div>
+    <div class="chip">B0 帧率 <b id="cRate">—</b></div>
+    <div class="chip">软上限 <b id="cCap">—</b></div>
+    <div class="chip">最近 B1 <b id="cB1">—</b></div>
+  </section>
+
+  <section class="chans">
+    <article class="card" data-ch="0">
+      <div class="cardHead">
+        <span class="tag">A 通道</span>
+        <span class="hint" data-role="linkText">回路闭合</span>
+        <label class="loopCtl" title="回路断开 = 电极没接通，真机上没有电流">
+          <span>回路</span>
+          <span class="switch"><input type="checkbox" data-role="loop" checked><span></span></span>
+        </label>
+      </div>
+      <div class="strength">
+        <div class="num"><span data-role="val">0</span><span class="cap"> / <span data-role="cap">200</span></span></div>
+        <div class="bar"><i data-role="fill" style="width:0"></i><u data-role="capmark" style="left:100%"></u></div>
+      </div>
+      <div class="row">
+        <button class="stepbtn" data-role="minus" title="强度 -1">−</button>
+        <button class="stepbtn" data-role="plus" title="强度 +1">＋</button>
+        <input type="number" min="0" max="200" step="1" value="0" data-role="abs">
+        <button data-role="set">设为</button>
+        <span class="hint">step <input type="number" min="1" max="50" value="1" data-role="step" style="width:52px"></span>
+      </div>
+      <div class="waveState" data-role="waveText">还没收到 B0</div>
+      <canvas data-role="scope"></canvas>
+      <div class="groups" data-role="groups"></div>
+    </article>
+
+    <article class="card" data-ch="1">
+      <div class="cardHead">
+        <span class="tag">B 通道</span>
+        <span class="hint" data-role="linkText">回路闭合</span>
+        <label class="loopCtl" title="回路断开 = 电极没接通，真机上没有电流">
+          <span>回路</span>
+          <span class="switch"><input type="checkbox" data-role="loop" checked><span></span></span>
+        </label>
+      </div>
+      <div class="strength">
+        <div class="num"><span data-role="val">0</span><span class="cap"> / <span data-role="cap">200</span></span></div>
+        <div class="bar"><i data-role="fill" style="width:0"></i><u data-role="capmark" style="left:100%"></u></div>
+      </div>
+      <div class="row">
+        <button class="stepbtn" data-role="minus" title="强度 -1">−</button>
+        <button class="stepbtn" data-role="plus" title="强度 +1">＋</button>
+        <input type="number" min="0" max="200" step="1" value="0" data-role="abs">
+        <button data-role="set">设为</button>
+        <span class="hint">step <input type="number" min="1" max="50" value="1" data-role="step" style="width:52px"></span>
+      </div>
+      <div class="waveState" data-role="waveText">还没收到 B0</div>
+      <canvas data-role="scope"></canvas>
+      <div class="groups" data-role="groups"></div>
+    </article>
+  </section>
+
+  <section class="logwrap">
+    <div class="logHead">
+      <h2>固件日志（'#' 行）</h2>
+      <label class="hint"><input type="checkbox" id="chkPause"> 暂停滚动</label>
+      <button id="btnClearLog">清空</button>
+      <div class="grow"></div>
+      <span class="hint" id="hintText">Chrome / Edge · Web Serial · 115200 8N1</span>
+    </div>
+    <pre id="log"></pre>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+// ── 串口协议（与 firmware/src/main.cpp 对齐）──────────────────────────────
+const CMD = {
+  RAW_OFF: 0xC0, RAW_ON: 0xC1, VERB_OFF: 0xC2, VERB_ON: 0xC3,
+  STR_SET: 0xD0,  // D0 ch value      强度绝对值
+  STR_STEP: 0xD1, // D1 ch delta(int8) 强度相对增减
+  LOOP: 0xD2,     // D2 ch on          回路开关
+};
+const CH_BOTH = 0xFF;
+
+// ── DOM 小工具 ───────────────────────────────────────────────────────────
+const $ = (sel, root = document) => root.querySelector(sel);
+const cards = [...document.querySelectorAll(".card")].map((el) => ({
+  el,
+  ch: Number(el.dataset.ch),
+  val: $('[data-role="val"]', el),
+  cap: $('[data-role="cap"]', el),
+  fill: $('[data-role="fill"]', el),
+  capmark: $('[data-role="capmark"]', el),
+  abs: $('[data-role="abs"]', el),
+  step: $('[data-role="step"]', el),
+  loop: $('[data-role="loop"]', el),
+  linkText: $('[data-role="linkText"]', el),
+  scope: $('[data-role="scope"]', el),
+  groups: $('[data-role="groups"]', el),
+  waveText: $('[data-role="waveText"]', el),
+  waveValid: null,    // 固件说这通道的 4 组合不合法（真机不输出）
+  hist: [],           // 每 25ms 一组，压平的历史（amp）
+  histFreq: [],
+  groupsData: null,   // [{f,a} x4] 或 null
+}));
+
+const state = {
+  connected: false,
+  verbose: true,
+  port: null,
+  reader: null,
+  writer: null,
+  reading: false,
+  stat: { conn: 0, sub: 0, rate: 0 },
+  strength: [0, 0],
+  cap: [200, 200],
+  loop: [true, true],
+};
+
+const MAX_POINTS = 400; // 400 组 × 25ms ≈ 10 秒
+
+// ── 日志面板 ─────────────────────────────────────────────────────────────
+const logEl = $("#log");
+const chkPause = $("#chkPause");
+function pushLog(text, cls) {
+  const line = document.createElement("div");
+  if (cls) line.className = cls;
+  line.textContent = text;
+  logEl.appendChild(line);
+  while (logEl.childElementCount > 300) logEl.removeChild(logEl.firstElementChild);
+  if (!chkPause.checked) logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, kind) {
+  $("#statusText").textContent = text;
+  const dot = $("#dot");
+  dot.className = "dot" + (kind ? " " + kind : "");
+}
+
+// ── 解析固件日志行 ───────────────────────────────────────────────────────
+function tokens(line) {
+  const out = { head: "" };
+  const parts = line.replace(/^#/, "").split(/\s+/);
+  for (const tok of parts) {
+    const i = tok.indexOf("=");
+    if (i > 0) {
+      const k = tok.slice(0, i);
+      if (!(k in out)) out[k] = tok.slice(i + 1); // 同名键只认第一个（STAT 里 A= 会重复）
+    } else if (!out.head) {
+      out.head = tok; // B0 / STAT / STRENGTH / SOFT / B1 / link:
+    }
+  }
+  return out;
+}
+
+function parseWaveCell(v) {
+  if (!v) return null;
+  const invalid = v.startsWith("!");        // 固件标记：整组作废（真机不输出该通道）
+  const body = invalid ? v.slice(1) : v;
+  const groups = body.split(",").map((s) => {
+    const [f, a] = s.split(":").map(Number);
+    return { f: f || 0, a: Number.isFinite(a) ? a : 0 };
+  });
+  if (groups.length !== 4) return null;
+  return { groups, valid: !invalid };
+}
+
+function applyStrength(a, b) {
+  if (!a || !b) return;
+  state.strength = [a.cur, b.cur];
+  state.cap = [a.cap, b.cap];
+  renderStrength();
+}
+
+function applyLink(a, b) {
+  state.loop = [a, b];
+  renderLink();
+}
+
+function applyLinkCell(v) {
+  const m = /^A(\d)\/B(\d)$/.exec(v || "");
+  if (m) applyLink(m[1] === "1", m[2] === "1");
+}
+
+function handleLine(raw) {
+  const line = raw.trimEnd();
+  if (!line) return;
+
+  // 1) 逐帧 B0（波形的真身，每 100ms 一条）
+  if (line.startsWith("#B0 ")) {
+    const t = tokens(line);
+    const sa = /^(\d+)\/(\d+)$/.exec(t.A || "");
+    const sb = /^(\d+)\/(\d+)$/.exec(t.B || "");
+    if (sa && sb) applyStrength({ cur: +sa[1], cap: +sa[2] }, { cur: +sb[1], cap: +sb[2] });
+    applyLinkCell(t.link);
+    pushWave(parseWaveCell(t.wA), parseWaveCell(t.wB));
+    pushLog(line, "l-b0");
+    return;
+  }
+
+  // 2) 周期 STAT：手机连没连、订阅、帧率
+  if (line.startsWith("#STAT ")) {
+    const t = tokens(line);
+    const sa = /^(\d+)\/(\d+)$/.exec(t.A || "");
+    const sb = /^(\d+)\/(\d+)$/.exec(t.B || "");
+    if (sa && sb) applyStrength({ cur: +sa[1], cap: +sa[2] }, { cur: +sb[1], cap: +sb[2] });
+    applyLinkCell(t.link);
+    if (t.conn !== undefined) state.stat.conn = +t.conn;
+    if (t.sub !== undefined) state.stat.sub = +t.sub;
+    const rate = /\(([\d.]+)\/s\)/.exec(line);
+    if (rate) state.stat.rate = Number(rate[1]);
+    renderChips();
+    pushLog(line, "l-b0");
+    return;
+  }
+
+  // 3) 强度变化（App 调的 / 本页发的都走这条）
+  const mStr = /STRENGTH A=(\d+)\/(\d+) B=(\d+)\/(\d+)/.exec(line);
+  if (mStr) {
+    applyStrength({ cur: +mStr[1], cap: +mStr[2] }, { cur: +mStr[3], cap: +mStr[4] });
+    pushLog(line, "l-str");
+    return;
+  }
+
+  // 4) 回路状态
+  if (/^#?link: loop/.test(line)) {
+    const la = /A=(closed|open)/.exec(line);
+    const lb = /B=(closed|open)/.exec(line);
+    if (la && lb) applyLink(la[1] === "closed", lb[1] === "closed");
+    pushLog(line, "l-link");
+    return;
+  }
+
+  // 5) B1 回包（手机强度回显的证据）
+  const mB1 = /B1 -> App seq=(\d+) A=(\d+) B=(\d+)/.exec(line);
+  if (mB1) {
+    $("#cB1").textContent = `seq=${mB1[1]} A=${mB1[2]} B=${mB1[3]}`;
+    pushLog(line, "l-link");
+    return;
+  }
+
+  // 6) 其它 '#' 行原样显示（SOFT LIMIT / IGNORED / 连接事件 / 错误）
+  if (line.startsWith("#")) {
+    const cls = /IGNORED|bad|fail|error|dropped/i.test(line) ? "l-err" : "";
+    pushLog(line, cls);
+  }
+}
+
+function pushWave(cellA, cellB) {
+  const feed = (card, cell) => {
+    card.groupsData = cell ? cell.groups : null;
+    card.waveValid = cell ? cell.valid : null;
+    if (cell) {
+      for (const g of cell.groups) {
+        card.hist.push(g.a);
+        card.histFreq.push(g.f);
+      }
+    } else {
+      for (let i = 0; i < 4; i++) {
+        card.hist.push(0);
+        card.histFreq.push(0);
+      }
+    }
+    while (card.hist.length > MAX_POINTS) {
+      card.hist.shift();
+      card.histFreq.shift();
+    }
+    renderGroups(card);
+    renderWaveText(card);
+    drawScope(card);
+  };
+  feed(cards[0], cellA);
+  feed(cards[1], cellB);
+}
+
+//: 一行说清"这个通道现在到底有没有在输出波形"
+function renderWaveText(card) {
+  const g = card.groupsData;
+  const el = card.waveText;
+  if (!g) {
+    el.textContent = "还没收到 B0（手机 App 没连 / 没在写指令）";
+    el.style.color = "var(--dim)";
+    return;
+  }
+  const maxAmp = Math.max(...g.map((x) => x.a));
+  if (!card.waveValid) {
+    el.textContent = "整组作废：有取值越界（频率需 10~240、强度需 0~100）→ 真机不输出该通道";
+    el.style.color = "var(--warn)";
+  } else if (maxAmp === 0) {
+    el.textContent = "波形强度全 0（App 在写 B0，但这一帧没有输出）";
+    el.style.color = "var(--dim)";
+  } else if (!state.loop[card.ch]) {
+    el.textContent = `回路断开 → 不输出（App 给的波形强度最高 ${maxAmp}）`;
+    el.style.color = "var(--warn)";
+  } else {
+    el.textContent = `输出中：峰值强度 ${maxAmp}，频率 ${g[0].f}~${Math.max(...g.map((x) => x.f))} Hz`;
+    el.style.color = "var(--ok)";
+  }
+}
+
+// ── 渲染 ─────────────────────────────────────────────────────────────────
+function renderChips() {
+  $("#cConn").textContent = state.stat.conn ? "已连接" : "未连接";
+  $("#cSub").textContent = state.stat.sub ? "已订阅" : "未订阅";
+  $("#cRate").textContent = state.stat.rate ? state.stat.rate.toFixed(1) + " 帧/秒" : "—";
+  $("#cCap").textContent = `A ${state.cap[0]} / B ${state.cap[1]}`;
+}
+
+function renderStrength() {
+  for (const card of cards) {
+    const cur = state.strength[card.ch];
+    const cap = state.cap[card.ch] || 200;
+    card.val.textContent = cur;
+    card.cap.textContent = cap;
+    card.fill.style.width = Math.min(100, (cur / 200) * 100) + "%";
+    card.capmark.style.left = Math.min(100, (cap / 200) * 100) + "%";
+    if (document.activeElement !== card.abs) card.abs.value = cur;
+  }
+  renderChips();
+}
+
+function renderLink() {
+  for (const card of cards) {
+    const closed = state.loop[card.ch];
+    card.el.classList.toggle("open", !closed);
+    card.loop.checked = closed;
+    card.linkText.textContent = closed ? "回路闭合" : "回路断开（无输出）";
+    card.linkText.style.color = closed ? "" : "var(--warn)";
+    renderWaveText(card);
+    drawScope(card);
+  }
+}
+
+function renderGroups(card) {
+  const g = card.groupsData;
+  card.groups.innerHTML = "";
+  for (let i = 0; i < 4; i++) {
+    const cell = document.createElement("div");
+    cell.className = "grp";
+    cell.title = `第 ${i + 1} 组（第 ${i * 25}~${i * 25 + 25} ms）：强度 / 频率`;
+    if (g) {
+      const bad = !card.waveValid || g[i].f < 10 || g[i].f > 240 || g[i].a > 100;
+      cell.classList.toggle("bad", bad);
+      cell.innerHTML = `<b>${g[i].a}</b><span class="fq">@${g[i].f} Hz</span>`;
+    } else {
+      cell.innerHTML = `<b>—</b><span class="fq">没收到 B0</span>`;
+    }
+    card.groups.appendChild(cell);
+  }
+}
+
+// 示波器：横轴 = 时间（每格 25ms），实心 = 波形强度 0~100，细线 = 频率 10~240
+function drawScope(card) {
+  const cvs = card.scope;
+  const dpr = window.devicePixelRatio || 1;
+  const w = cvs.clientWidth || 400;
+  const h = 108;
+  if (cvs.width !== Math.round(w * dpr) || cvs.height !== Math.round(h * dpr)) {
+    cvs.width = Math.round(w * dpr);
+    cvs.height = Math.round(h * dpr);
+  }
+  const ctx = cvs.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  // 网格
+  ctx.strokeStyle = "#241f16";
+  ctx.lineWidth = 1;
+  for (let i = 1; i < 4; i++) {
+    const y = (h * i) / 4 + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(0, y);
+    ctx.lineTo(w, y);
+    ctx.stroke();
+  }
+
+  const n = card.hist.length;
+  const closed = state.loop[card.ch];
+  const main = card.ch === 0 ? "#ffe99d" : "#9dd8ff";
+
+  if (n < 2) {
+    ctx.fillStyle = "#5b5546";
+    ctx.font = "12px sans-serif";
+    ctx.fillText("等手机 App 的 B0…（每 100ms 一帧，每帧 4 组 × 25ms）", 10, h / 2);
+    return;
+  }
+
+  const xAt = (i) => (i / (MAX_POINTS - 1)) * w;
+  const yAmp = (a) => h - (Math.max(0, Math.min(100, a)) / 100) * (h - 8) - 2;
+  const yFreq = (f) => h - ((Math.max(0, Math.min(240, f)) - 10) / 230) * (h - 8) - 2;
+
+  // 有没有真的在输出：整组作废 / 全 0 / 回路断开 → 都算"没输出"
+  const peak = Math.max(...card.hist.slice(-8));
+  const active = card.waveValid !== false && closed && peak > 0;
+
+  // 强度（面积）
+  const start = MAX_POINTS - n;
+  ctx.beginPath();
+  ctx.moveTo(xAt(start), h);
+  for (let i = 0; i < n; i++) {
+    ctx.lineTo(xAt(start + i), yAmp(card.hist[i]));
+  }
+  ctx.lineTo(xAt(start + n - 1), h);
+  ctx.closePath();
+  const grad = ctx.createLinearGradient(0, 0, 0, h);
+  grad.addColorStop(0, active ? main + "88" : "rgba(130,130,130,.22)");
+  grad.addColorStop(1, "rgba(0,0,0,0)");
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xAt(start + i);
+    const y = yAmp(card.hist[i]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.lineWidth = 1.6;
+  ctx.strokeStyle = active ? main : "#6b6558";
+  ctx.stroke();
+
+  // 频率（细线）
+  ctx.beginPath();
+  for (let i = 0; i < n; i++) {
+    const x = xAt(start + i);
+    const y = yFreq(card.histFreq[i]);
+    if (i === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  }
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = active ? "rgba(255,255,255,.22)" : "rgba(150,150,150,.14)";
+  ctx.stroke();
+
+  let label = "";
+  if (card.waveValid === false) label = "整组作废（取值越界）：真机不输出该通道";
+  else if (!closed) label = "回路断开：波形不输出";
+  else if (peak === 0) label = "波形强度全 0：没有输出";
+  if (label) {
+    ctx.fillStyle = "rgba(255,157,157,.85)";
+    ctx.font = "12px sans-serif";
+    ctx.fillText(label, 10, 16);
+  }
+}
+
+// ── 发命令 ───────────────────────────────────────────────────────────────
+async function sendBytes(bytes, note) {
+  if (!state.writer) {
+    pushLog(`（未连接，命令丢弃：${note}）`, "l-err");
+    return;
+  }
+  try {
+    await state.writer.write(new Uint8Array(bytes));
+  } catch (err) {
+    pushLog(`写串口失败：${err.message}`, "l-err");
+  }
+}
+const sendStep = (ch, delta) => sendBytes([CMD.STR_STEP, ch, delta & 0xFF], `step ${delta}`);
+const sendSet = (ch, value) => sendBytes([CMD.STR_SET, ch, Math.max(0, Math.min(200, value))], `set ${value}`);
+const sendLoop = (ch, on) => sendBytes([CMD.LOOP, ch, on ? 1 : 0], `loop ${on}`);
+
+// ── 交互绑定 ─────────────────────────────────────────────────────────────
+for (const card of cards) {
+  const stepOf = () => Math.max(1, Math.min(50, Number(card.step.value) || 1));
+
+  // 点动：点一下 ±step，按住连发
+  const nudge = (sign) => sendStep(card.ch, sign * stepOf());
+  for (const [role, sign] of [["minus", -1], ["plus", 1]]) {
+    const btn = $(`[data-role="${role}"]`, card.el);
+    let timer = null;
+    let repeat = null;
+    const stop = () => {
+      clearTimeout(timer);
+      clearInterval(repeat);
+      timer = repeat = null;
+    };
+    btn.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      nudge(sign);
+      timer = setTimeout(() => {
+        repeat = setInterval(() => nudge(sign), 90);
+      }, 420);
+    });
+    for (const ev of ["pointerup", "pointerleave", "pointercancel"]) {
+      btn.addEventListener(ev, stop);
+    }
+  }
+
+  $('[data-role="set"]', card.el).addEventListener("click", () => {
+    const v = Math.round(Number(card.abs.value));
+    if (Number.isFinite(v)) sendSet(card.ch, v);
+  });
+  card.abs.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter") $('[data-role="set"]', card.el).click();
+  });
+
+  card.loop.addEventListener("change", () => {
+    sendLoop(card.ch, card.loop.checked);
+    // 等固件回 'link: loop ...' 再定稿；先乐观更新一下配色
+    state.loop[card.ch] = card.loop.checked;
+    renderLink();
+  });
+}
+
+// ── Web Serial 连接 ──────────────────────────────────────────────────────
+async function connect() {
+  if (!("serial" in navigator)) {
+    setStatus("此浏览器不支持 Web Serial", "err");
+    pushLog("请用 Chrome 或 Edge；若是 file:// 打不开，用 `python -m http.server 8000` 后开 http://localhost:8000/", "l-err");
+    return;
+  }
+  let port;
+  try {
+    port = await navigator.serial.requestPort();
+    await port.open({ baudRate: 115200, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" });
+  } catch (err) {
+    setStatus("打开失败：" + err.message, "err");
+    pushLog(`打开串口失败：${err.message}（串口被别的程序占着？监视器/上位机要先关掉）`, "l-err");
+    return;
+  }
+  try {
+    // 压住 DTR/RTS，尽量避免把板子拉进复位/下载模式
+    await port.setSignals({ dataTerminalReady: false, requestToSend: false });
+  } catch (_) { /* 有些驱动不支持，忽略 */ }
+
+  state.port = port;
+  state.writer = port.writable.getWriter();
+  state.connected = true;
+  $("#btnConnect").textContent = "断开串口";
+  $("#btnConnect").classList.add("armed");
+  setStatus("已连接 115200 8N1", "on");
+  pushLog("#—— 已连接串口；等固件日志（板子可能在打开时复位一次）", "l-link");
+
+  // 让固件逐条打 B0（幂等）。★ 绝不要发 0xCE —— 那个字节会打开原始二进制帧上行
+  await sendBytes([state.verbose ? CMD.VERB_ON : CMD.VERB_OFF], "verbose");
+
+  readLoop();
+}
+
+async function readLoop() {
+  const port = state.port;
+  if (!port || !port.readable) return;
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  state.reading = true;
+  let buf = "";
+  while (state.reading && port.readable) {
+    const reader = port.readable.getReader();
+    state.reader = reader;
+    try {
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (!value) continue;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          handleLine(buf.slice(0, idx));
+          buf = buf.slice(idx + 1);
+        }
+        if (buf.length > 8192) buf = ""; // 没有换行的二进制垃圾 → 丢掉
+      }
+    } catch (err) {
+      if (state.reading) pushLog(`读串口出错：${err.message}`, "l-err");
+    } finally {
+      try { reader.releaseLock(); } catch (_) {}
+      state.reader = null;
+    }
+    break;
+  }
+}
+
+async function disconnect() {
+  state.reading = false;
+  try { await state.reader?.cancel(); } catch (_) {}
+  try { state.writer?.releaseLock(); } catch (_) {}
+  state.writer = null;
+  try { await state.port?.close(); } catch (_) {}
+  state.port = null;
+  state.connected = false;
+  $("#btnConnect").textContent = "连接串口";
+  $("#btnConnect").classList.remove("armed");
+  setStatus("未连接", "");
+  state.stat = { conn: 0, sub: 0, rate: 0 };
+  renderChips();
+}
+
+$("#btnConnect").addEventListener("click", () => {
+  if (state.connected) disconnect();
+  else connect();
+});
+
+$("#btnVerbose").addEventListener("click", async (ev) => {
+  state.verbose = !state.verbose;
+  ev.target.textContent = `逐帧日志：${state.verbose ? "开" : "关"}`;
+  await sendBytes([state.verbose ? CMD.VERB_ON : CMD.VERB_OFF], "verbose");
+});
+
+$("#btnClearLog").addEventListener("click", () => { logEl.innerHTML = ""; });
+
+navigator.serial?.addEventListener("disconnect", () => {
+  pushLog("#—— 串口设备被拔出", "l-err");
+  disconnect();
+});
+
+// 窗口大小变化时重画
+window.addEventListener("resize", () => cards.forEach(drawScope));
+
+// 初始渲染
+renderStrength();
+renderLink();
+renderChips();
+cards.forEach((card) => { renderGroups(card); renderWaveText(card); drawScope(card); });
+</script>
+</body>
+</html>
